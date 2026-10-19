@@ -1,7 +1,6 @@
 #import <Cocoa/Cocoa.h>
+#import <objc/message.h>
 #import <objc/runtime.h>
-#include <mach-o/dyld.h>
-#include <dlfcn.h>
 
 // ============================================================================
 // Overview
@@ -11,8 +10,8 @@
 // classify each window and apply one of two treatments:
 //
 //   * Base treatment      — every target window. Forces a standard titled
-//                           NSWindow with visible traffic-light buttons and
-//                           an opaque, non-hidden titlebar.
+//                           NSWindow with visible traffic-light buttons, an
+//                           opaque, non-hidden titlebar, and a centered title.
 //
 //   * Then either:
 //     - Native treatment   — non-Electron windows. Ensures the app's NSToolbar
@@ -88,17 +87,57 @@ static CTWindowStack CTClassifyWindow(NSWindow *window) {
 
 #pragma mark - Base treatment
 
+// macOS 26 leading-aligns the window title whenever the Liquid Glass
+// ("Solarium") appearance is active and the window has neither a
+// Preference-style toolbar nor a leading titlebar accessory
+// (-[NSThemeFrame _defaultTitlebarTitleRect]). The classic look centers the
+// title unconditionally. The theme-frame swizzle below makes AppKit pick its
+// centered rect for target windows; this helper re-runs AppKit's title layout
+// when the existing title field was placed before the swizzle took effect
+// (or before the window became a target). Idempotent: it only triggers the
+// relayout when the field's x origin disagrees with the computed rect.
+static void CTCenterTitleIfStale(NSWindow *window) {
+    NSView *themeFrame = window.contentView.superview;
+    SEL fieldSel = NSSelectorFromString(@"_titleTextField");
+    SEL frameSel = NSSelectorFromString(@"_titleTextFieldFrame");
+    SEL relayoutSel = NSSelectorFromString(@"windowTitlePositionChanged");
+    if (!themeFrame ||
+        ![themeFrame respondsToSelector:fieldSel] ||
+        ![themeFrame respondsToSelector:frameSel] ||
+        ![themeFrame respondsToSelector:relayoutSel]) {
+        return;
+    }
+    NSView *field = ((id (*)(id, SEL))objc_msgSend)(themeFrame, fieldSel);
+    if (!field) return;
+    NSRect want = ((NSRect (*)(id, SEL))objc_msgSend)(themeFrame, frameSel);
+    if (fabs(want.origin.x - field.frame.origin.x) > 0.5) {
+        ((void (*)(id, SEL))objc_msgSend)(themeFrame, relayoutSel);
+    }
+}
+
 static NSWindowStyleMask CTDesiredStyleMask(NSWindowStyleMask current) {
     NSWindowStyleMask mask = current;
+    // Only the two bits the classic-titlebar goal actually requires: ensure
+    // the window is titled (so there is a titlebar to center the title in)
+    // and clear FullSizeContentView (so the content no longer extends behind
+    // it). We deliberately do NOT force Closable/Miniaturizable/Resizable:
+    // adding those to a window the app made fixed-size or button-less (large
+    // sheets, fixed dialogs) changes behavior the user never asked for. The
+    // traffic-light buttons we unhide in the base treatment still appear for
+    // whatever buttons the window's own mask already enables.
     mask |= NSWindowStyleMaskTitled;
-    mask |= NSWindowStyleMaskClosable;
-    mask |= NSWindowStyleMaskMiniaturizable;
-    mask |= NSWindowStyleMaskResizable;
     mask &= ~NSWindowStyleMaskFullSizeContentView;
     return mask;
 }
 
 // Universal across every whitelisted app. Idempotent.
+//
+// NOTE: this also mutates `styleMask` on Catalyst windows (Messages'
+// UINSWindow, Reminders' TUINSWindow), which drives the UIKit->AppKit
+// bridge. Verified safe on macOS 26 (Tahoe, Darwin 25.6). This is the most
+// OS-version-sensitive line in the tweak: re-test on every major macOS
+// update, and treat it as the first suspect if Messages or Reminders start
+// misbehaving or failing to launch after an update.
 static void CTApplyBaseTreatment(NSWindow *window) {
     NSWindowStyleMask desired = CTDesiredStyleMask(window.styleMask);
     if (window.styleMask != desired) {
@@ -120,6 +159,8 @@ static void CTApplyBaseTreatment(NSWindow *window) {
         NSButton *btn = [window standardWindowButton:btnTypes[i]];
         if (btn.isHidden) btn.hidden = NO;
     }
+
+    CTCenterTitleIfStale(window);
 }
 
 #pragma mark - Native treatment
@@ -257,7 +298,7 @@ static BOOL CTInstallElectronContentRectSwizzleIfPossible(void) {
 
 // Applied in addition to the base treatment for ElectronNSWindow instances.
 static void CTApplyElectronTreatment(NSWindow *window) {
-    CTInstallElectronContentRectSwizzleIfPossible();
+    BOOL justInstalled = CTInstallElectronContentRectSwizzleIfPossible();
 
     CTStripElectronCustomChrome(window);
 
@@ -269,15 +310,32 @@ static void CTApplyElectronTreatment(NSWindow *window) {
         }
     }
 
-    // Force Chromium through a real resize cycle. Setting the frame to
-    // exactly its current value is a no-op that BridgedContentView's
-    // setFrameSize: override can ignore; growing by 1px then shrinking back
-    // forces a genuine resize where Chromium honors our inset content rect.
-    NSRect frame = window.frame;
-    NSRect jiggle = frame;
-    jiggle.size.height += 1;
-    [window setFrame:jiggle display:NO];
-    [window setFrame:frame display:YES];
+    // Force Chromium through a real resize cycle so it honors our inset
+    // content rect. Setting the frame to exactly its current value is a
+    // no-op that BridgedContentView's setFrameSize: override can ignore;
+    // growing by 1px then shrinking back forces a genuine resize.
+    //
+    // This is expensive (a full Chromium relayout), so do it ONLY when the
+    // layout is actually stale: right after installing the contentRect
+    // swizzle, or when this window's content view still extends behind the
+    // titlebar. Once contentRectForFrameRect: is swizzled, correctly-laid-out
+    // windows report the right height on every subsequent focus, so this
+    // branch is skipped — focusing Slack no longer triggers a relayout.
+    BOOL needs_relayout = justInstalled;
+    NSView *content = window.contentView;
+    if (!needs_relayout && content) {
+        NSRect want = [window contentRectForFrameRect:window.frame];
+        if (fabs(want.size.height - content.frame.size.height) > 0.5) {
+            needs_relayout = YES;
+        }
+    }
+    if (needs_relayout) {
+        NSRect frame = window.frame;
+        NSRect jiggle = frame;
+        jiggle.size.height += 1;
+        [window setFrame:jiggle display:NO];
+        [window setFrame:frame display:YES];
+    }
 }
 
 #pragma mark - Per-window patch dispatcher
@@ -423,10 +481,38 @@ static void CTSwizzleInstanceMethod(Class cls, SEL original, SEL replacement) {
 @implementation NSView (ClassicTitlebarContainer)
 - (void)ct_titlebarContainer_setFrame:(NSRect)frame {
     [self ct_titlebarContainer_setFrame:frame];
-    NSWindow *win = self.window;
-    if (win && CTIsTargetWindow(win) && CTIsElectronWindow(win)) {
-        CTConstrainTitlebarContainer(self);
+    // Only act when something inflated the container past the classic 28pt.
+    // In the steady state Slack sets the frame at the correct height, so this
+    // gate skips the subview/button walk entirely and keeps the swizzle off
+    // the hot path. When we do re-constrain, our own setFrame to 28pt re-enters
+    // here with height == 28 and stops — bounding the recursion at one level.
+    if (frame.size.height > 28.0) {
+        NSWindow *win = self.window;
+        if (win && CTIsTargetWindow(win) && CTIsElectronWindow(win)) {
+            CTConstrainTitlebarContainer(self);
+        }
     }
+}
+@end
+
+#pragma mark - NSThemeFrame swizzle (centered title)
+
+// AppKit asks -[NSThemeFrame _defaultTitlebarTitleRect] where to put the
+// title, and on macOS 26 it answers with the leading-aligned rect for most
+// Liquid Glass windows. For target windows, answer with AppKit's own centered
+// rect instead; every other window gets the stock behavior. Installed on the
+// private NSThemeFrame class, so the category lives on NSView.
+@interface NSView (ClassicTitlebarThemeFrame)
+- (NSRect)ct_defaultTitlebarTitleRect;
+@end
+
+@implementation NSView (ClassicTitlebarThemeFrame)
+- (NSRect)ct_defaultTitlebarTitleRect {
+    SEL centeredSel = NSSelectorFromString(@"_defaultCenteredTitlebarTitleRect");
+    if (CTIsTargetWindow(self.window) && [self respondsToSelector:centeredSel]) {
+        return ((NSRect (*)(id, SEL))objc_msgSend)(self, centeredSel);
+    }
+    return [self ct_defaultTitlebarTitleRect];
 }
 @end
 
@@ -458,43 +544,8 @@ static void CTSwizzleInstanceMethod(Class cls, SEL original, SEL replacement) {
 
 #pragma mark - Init
 
-// Ammonia injects this dylib far more broadly than its documented
-// per-tweak whitelist suggests — Safari, sw_vers, chrome_crashpad_handler
-// and other unrelated processes all dlopen us. So we re-enforce the
-// whitelist ourselves at constructor time. Same semantics as the README
-// claims for Ammonia: each non-blank line is a substring that must
-// appear in the executable path returned by _NSGetExecutablePath. The
-// whitelist file is located next to the dylib on disk (same basename +
-// ".whitelist"), so non-default install locations still work. If the
-// file is missing or unreadable, treat that as "nothing whitelisted" and
-// bail — safer than the over-broad default.
-static BOOL CTProcessIsWhitelisted(void) {
-    char exeBuf[PATH_MAX];
-    uint32_t bufSize = sizeof(exeBuf);
-    if (_NSGetExecutablePath(exeBuf, &bufSize) != 0) return NO;
-    NSString *exePath = @(exeBuf);
-    if (!exePath) return NO;
-
-    Dl_info dlinfo;
-    if (dladdr((const void *)&CTProcessIsWhitelisted, &dlinfo) == 0) return NO;
-    NSString *whitelistPath = [@(dlinfo.dli_fname) stringByAppendingString:@".whitelist"];
-
-    NSString *whitelist = [NSString stringWithContentsOfFile:whitelistPath
-                                                    encoding:NSUTF8StringEncoding
-                                                       error:NULL];
-    if (whitelist.length == 0) return NO;
-
-    for (NSString *line in [whitelist componentsSeparatedByString:@"\n"]) {
-        NSString *entry = [line stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-        if (entry.length == 0) continue;
-        if ([exePath containsString:entry]) return YES;
-    }
-    return NO;
-}
-
 __attribute__((constructor))
 static void ClassicTitlebarInit(void) {
-    if (!CTProcessIsWhitelisted()) return;
     NSLog(@"[ClassicTitlebar] Loaded into %@", NSBundle.mainBundle.bundleIdentifier ?: @"(unknown)");
 
     // Install method swizzles synchronously, in the constructor, so they're
@@ -518,6 +569,13 @@ static void ClassicTitlebarInit(void) {
                                 @selector(ct_titlebarContainer_setFrame:));
     }
 
+    Class themeFrameClass = NSClassFromString(@"NSThemeFrame");
+    if (themeFrameClass) {
+        CTSwizzleInstanceMethod(themeFrameClass,
+                                NSSelectorFromString(@"_defaultTitlebarTitleRect"),
+                                @selector(ct_defaultTitlebarTitleRect));
+    }
+
     CTInstallElectronContentRectSwizzleIfPossible();
 
     // Things that depend on the main runloop are deferred to dispatch_async:
@@ -538,11 +596,15 @@ static void ClassicTitlebarInit(void) {
             }
         };
 
+        // Observe become-key only. Become-main and become-key almost always
+        // fire together for these top-level windows, so observing both ran
+        // the full treatment twice per focus. Window appearance is already
+        // covered by the orderFront:/makeKeyAndOrderFront: swizzles and the
+        // initial sweep above, and Electron's web-reload re-inflation is
+        // caught by the NSTitlebarContainerView setFrame: swizzle — so a
+        // single become-key observer is a sufficient backstop at half the
+        // per-focus work.
         NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
-        [nc addObserverForName:NSWindowDidBecomeMainNotification
-                        object:nil
-                         queue:NSOperationQueue.mainQueue
-                    usingBlock:patchSender];
         [nc addObserverForName:NSWindowDidBecomeKeyNotification
                         object:nil
                          queue:NSOperationQueue.mainQueue

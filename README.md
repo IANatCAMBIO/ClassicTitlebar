@@ -2,10 +2,18 @@
 
 A small Ammonia tweak dylib that forces classic AppKit titlebars for whitelisted apps. Defaults ship with:
 
-- Slack: `/Slack.app/Contents/MacOS/Slack`
-- Apple Notes: `/Notes.app/Contents/MacOS/Notes`
+- Slack: `Slack`
+- Apple Notes: `Notes`
+- Calendar: `Calendar`
+- Messages: `Messages`
+- Reminders: `Reminders`
+- Mail: `Mail`
+- Terminal: `Terminal`
+- Finder: `Finder`
 
-Targeting uses Ammonia's native per-tweak whitelist. The companion file `ClassicTitlebar.dylib.whitelist` lists one substring per line; Ammonia injects the dylib when the line appears anywhere in the target process's executable path (from `_NSGetExecutablePath`, not the bundle identifier). Pick substrings narrow enough to avoid matching helpers and renderers — `/Slack.app/Contents/MacOS/Slack` matches Slack's main process but not `Slack Helper`. To target additional apps, add an exe-path substring to the installed whitelist and relaunch the app.
+Slack is the Electron case; Notes, Calendar, Mail, Terminal and Finder are native AppKit; Messages and Reminders are Mac Catalyst (base titlebar treatment only — see "How it works").
+
+Targeting uses Ammonia's native per-tweak whitelist. The companion file `ClassicTitlebar.dylib.whitelist` lists one entry per line, and Ammonia injects the dylib only when a line is an **exact match** for either the target process's full executable path (from `_NSGetExecutablePath`) or its last path component — never a substring, and never the bundle identifier. `Slack` therefore matches `/Applications/Slack.app/Contents/MacOS/Slack` but not `Slack Helper (Renderer)`, and a bare executable name works whether the app lives in `/Applications` or `/System/Applications`. Use a full path only when two different apps share an executable name. To target additional apps, add the executable name to the installed whitelist and relaunch the app.
 
 ## Build
 
@@ -21,7 +29,7 @@ This produces `ClassicTitlebar.dylib`. The linker auto-applies an `adhoc,linker-
 make install
 ```
 
-`make install` won't overwrite an existing whitelist; the default Slack+Notes whitelist is only installed if no whitelist file is present.
+`make install` won't overwrite an existing whitelist; the default whitelist is only installed if no whitelist file is present. To push a changed whitelist, copy it by hand (see below).
 
 Or manually:
 
@@ -37,7 +45,7 @@ Then relaunch the whitelisted apps.
 
 Each target window gets one of two treatments depending on its NSWindow subclass; classification happens at runtime, so adding a new app to the whitelist requires no code changes.
 
-**Base treatment — applied to every target window.** Forces a standard titled NSWindow with `FullSizeContentView` stripped, ensures the titlebar is opaque and the title is visible, and unhides the traffic-light buttons. Toolbar / subtitle / titlebar-accessory APIs are left alone so native AppKit apps render their normal chrome.
+**Base treatment — applied to every target window.** Forces a standard titled NSWindow with `FullSizeContentView` stripped, ensures the titlebar is opaque and the title is visible, unhides the traffic-light buttons, and centers the title. macOS 26 leading-aligns titles under the Liquid Glass appearance unless the window has a Preference-style toolbar or a leading titlebar accessory; the tweak swizzles `-[NSThemeFrame _defaultTitlebarTitleRect]` to return AppKit's centered rect for target windows and re-runs the title layout when a window's title field was placed before the swizzle applied. Toolbar / subtitle / titlebar-accessory APIs are left alone so native AppKit apps render their normal chrome.
 
 **Electron treatment — applied additionally when the window is an `ElectronNSWindow`.** Electron treats its NSWindow as frameless and renders chrome in HTML; this branch undoes that:
 
