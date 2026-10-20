@@ -10,7 +10,7 @@ all: $(OUT)
 $(OUT): $(SRC)
 	clang -dynamiclib -fobjc-arc \
 		-isysroot "$$(xcrun --sdk $(SDK) --show-sdk-path)" \
-		-framework Cocoa \
+		-framework Cocoa -framework QuartzCore \
 		-arch arm64 -arch arm64e -arch x86_64 \
 		-Wall -Wextra -Wno-unused-parameter \
 		-o $(OUT) $(SRC)

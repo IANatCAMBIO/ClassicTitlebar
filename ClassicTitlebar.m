@@ -1,4 +1,5 @@
 #import <Cocoa/Cocoa.h>
+#import <QuartzCore/QuartzCore.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
 
@@ -516,6 +517,103 @@ static void CTSwizzleInstanceMethod(Class cls, SEL original, SEL replacement) {
 }
 @end
 
+#pragma mark - Titlebar decoration swizzle (sharp corner overrides)
+
+// With NSConvolutionOverride1 set, AppKit rounds the window shape at the
+// override radius, but the classic (non-Liquid-Glass) titlebar outline is a
+// CoreUI-rendered image with the stock radius baked in. That image paints a
+// grey crescent between the old and new curves. The outline lives in the
+// decoration view's CUIWindowFrameLayer as its borderLayer. We hide it and
+// stroke its visible part — a faint white top-edge highlight, one pixel row
+// at roughly the stock brightness — ourselves along the override radius. Only
+// applied while the override is active, and only on target windows.
+static CGFloat CTCornerOverrideRadius(void) {
+    return [NSUserDefaults.standardUserDefaults floatForKey:@"NSConvolutionOverride1"];
+}
+
+// Builds the top-edge highlight path for a titlebar of the given size:
+// down-left corner arc, straight top edge, down-right corner arc. Layer
+// coordinates are y-up, so the top edge is at y == size.height.
+static CGPathRef CTCreateTopHighlightPath(CGSize size, CGFloat radius, CGFloat inset) {
+    CGMutablePathRef path = CGPathCreateMutable();
+    CGFloat top = size.height - inset;
+    CGPathMoveToPoint(path, NULL, inset, top - radius);
+    CGPathAddArc(path, NULL, radius, top - radius, radius - inset, M_PI, M_PI_2, YES);
+    CGPathAddLineToPoint(path, NULL, size.width - radius, top);
+    CGPathAddArc(path, NULL, size.width - radius, top - radius, radius - inset, M_PI_2, 0, YES);
+    return path;
+}
+
+static void CTReplaceDecorationBorder(NSView *decorationView) {
+    static NSString *const highlight_name = @"ct_top_highlight";
+    SEL borderSel = NSSelectorFromString(@"borderLayer");
+    CGFloat radius = CTCornerOverrideRadius();
+    if (radius <= 0 || !CTIsTargetWindow(decorationView.window)) return;
+
+    CALayer *host = decorationView.layer;
+    for (CALayer *layer in host.sublayers) {
+        if (![layer respondsToSelector:borderSel]) continue;
+        CALayer *border = ((id (*)(id, SEL))objc_msgSend)(layer, borderSel);
+        if (border && !border.hidden) border.hidden = YES;
+    }
+
+    CAShapeLayer *line = nil;
+    for (CALayer *layer in host.sublayers) {
+        if ([layer.name isEqualToString:highlight_name]) line = (CAShapeLayer *)layer;
+    }
+    if (!line) {
+        line = [CAShapeLayer layer];
+        line.name = highlight_name;
+        line.fillColor = NULL;
+        line.strokeColor = CGColorGetConstantColor(kCGColorWhite);
+        line.lineWidth = 0.5;
+        line.opacity = 0.35;
+        line.mask = [CAGradientLayer layer];
+        [host addSublayer:line];
+    }
+    // A free-standing layer animates frame/path changes implicitly, which
+    // would make the line trail the titlebar during a live resize.
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    line.frame = host.bounds;
+
+    // Fade the corner arcs out over the corner's height, as the stock outline
+    // does, so the line doesn't end in a hard cut where the corner meets the
+    // window's vertical edge. Layer space is y-up: the gradient runs bottom
+    // (transparent) to top (opaque).
+    CAGradientLayer *fade = (CAGradientLayer *)line.mask;
+    CGFloat height = host.bounds.size.height;
+    fade.frame = host.bounds;
+    fade.startPoint = CGPointMake(0.5, 0.0);
+    fade.endPoint = CGPointMake(0.5, 1.0);
+    fade.colors = @[ (id)CGColorGetConstantColor(kCGColorClear),
+                     (id)CGColorGetConstantColor(kCGColorClear),
+                     (id)CGColorGetConstantColor(kCGColorWhite) ];
+    fade.locations = @[ @0.0, @((height - radius) / height), @((height - 1.0) / height) ];
+
+    CGPathRef path = CTCreateTopHighlightPath(host.bounds.size, radius, 0.5);
+    line.path = path;
+    CGPathRelease(path);
+    [CATransaction commit];
+}
+
+@interface NSView (ClassicTitlebarDecoration)
+- (void)ct_decoration_updateLayer;
+- (void)ct_decoration_layout;
+@end
+
+@implementation NSView (ClassicTitlebarDecoration)
+- (void)ct_decoration_updateLayer {
+    [self ct_decoration_updateLayer];
+    CTReplaceDecorationBorder(self);
+}
+
+- (void)ct_decoration_layout {
+    [self ct_decoration_layout];
+    CTReplaceDecorationBorder(self);
+}
+@end
+
 #pragma mark - ElectronNSWindow swizzle (the load-bearing fix)
 
 // Electron overrides -contentRectForFrameRect: to return the full frame
@@ -574,6 +672,12 @@ static void ClassicTitlebarInit(void) {
         CTSwizzleInstanceMethod(themeFrameClass,
                                 NSSelectorFromString(@"_defaultTitlebarTitleRect"),
                                 @selector(ct_defaultTitlebarTitleRect));
+    }
+
+    Class decorationClass = NSClassFromString(@"_NSTitlebarDecorationView");
+    if (decorationClass) {
+        CTSwizzleInstanceMethod(decorationClass, @selector(updateLayer), @selector(ct_decoration_updateLayer));
+        CTSwizzleInstanceMethod(decorationClass, @selector(layout), @selector(ct_decoration_layout));
     }
 
     CTInstallElectronContentRectSwizzleIfPossible();
